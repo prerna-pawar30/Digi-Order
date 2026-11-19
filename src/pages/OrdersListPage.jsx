@@ -1,0 +1,584 @@
+/**
+ * Table of manual orders with search, status / payment actions, courier, returns and invoice PDF;
+ * opens OrderDetailDrawer.
+ *
+ * Route: /orders
+ * Used by: routes/AppRoutes.jsx
+ * API: InvoiceService.getAllInvoices, InvoiceService.getInvoiceById, ManualOrderService.getAll,
+ * ManualOrderService.updatePaymentStatus, ManualOrderService.updateStatus
+ */
+
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { Search, Plus, ChevronLeft, ChevronRight, Loader2, Inbox, FileDown } from "lucide-react";
+import toast from "react-hot-toast";
+import { ManualOrderService, InvoiceService } from "../backend/ApiService";
+import { OrderStatusBadge, PaymentStatusBadge, statusLabel } from "../components/order/StatusBadge";
+import { formatDateTime, initials } from "../utils/Format";
+import { generateInvoicePdf } from "../utils/InvoicePdf";
+import { fetchAllInvoices } from "../utils/InvoiceCustomers";
+import { withInvoicePayment } from "../utils/InvoiceHelpers";
+import OrderDetailDrawer from "../components/order/OrderDetailDrawer";
+import CourierAssignModal from "../components/order/CourierAssignModal";
+import CancelOrderModal from "../components/order/CancelOrderModal";
+import MarkPaidModal from "../components/invoice/MarkPaidModal";
+import SettleRefundModal from "../components/creditnote/SettleRefundModal";
+import StatusActionMenu from "../components/order/StatusActionMenu";
+import PaymentActionMenu from "../components/invoice/PaymentActionMenu";
+import { OrderTotal } from "../components/order/OrderTotal";
+
+// Mirrors the backend's statusFlow in manualOrder.service.js — only these
+// forward transitions succeed against PATCH /manual-order/status/:orderId.
+// partial_returned/returned go through the Return flow in the drawer, so
+// they're never offered here.
+// "shipped" is deliberately NOT offered directly from "placed" or "packed"
+// — courier details are only collected when an order moves through
+// "confirmed" (see CourierAssignModal), so every order must pass through
+// that step before it can be marked shipped. Without this, staff could
+// jump straight to "Shipped" with no courier/tracking info on file.
+const STATUS_FLOW = {
+  placed: ["packed", "confirmed"],
+  packed: ["confirmed"],
+  confirmed: ["shipped"],
+  shipped: ["delivered"],
+};
+
+// Mirrors cancelManualOrderService's nonCancellable list on the backend.
+const NON_CANCELLABLE = ["delivered", "cancelled", "shipped"];
+
+// The full "MORD-1f19f9e6-69d2-65a0-975f-146b741a1009" id is unreadable at a
+// glance and wraps across several lines in a table cell — show just enough
+// to tell orders apart at sight, with the full id still one click away.
+const shortOrderId = (id) => {
+  if (!id) return "—";
+  const parts = id.split("-");
+  return parts.length > 2 ? `${parts[0]}-${parts[1]}` : id;
+};
+
+const createdByName = (order) => {
+  const callback = order.createdBy;
+  if (!callback) return null;
+  return (
+    [callback.firstName, callback.lastName].filter(Boolean).join(" ").trim() ||
+    callback.email ||
+    null
+  );
+};
+
+export default function OrdersListPage() {
+  const navigate = useNavigate();
+  const [orders, setOrders] = useState([]);
+  // Invoices loaded with the list, reused by the drawer + Invoice download
+  // so they don't each fetch the same invoice again.
+  const [invoiceById, setInvoiceById] = useState(() => new Map());
+  const [pagination, setPagination] = useState({ page: 1, limit: 10, total: 0, totalPages: 1 });
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+  const [activeOrder, setActiveOrder] = useState(null);
+  const [updatingOrderId, setUpdatingOrderId] = useState(null);
+  const [updatingPaymentId, setUpdatingPaymentId] = useState(null);
+  const [courierModalOrder, setCourierModalOrder] = useState(null);
+  const [cancelModalOrder, setCancelModalOrder] = useState(null);
+  const [paidModalOrder, setPaidModalOrder] = useState(null);
+  const [settleRefundOrder, setSettleRefundOrder] = useState(null);
+  const [downloadingInvoiceId, setDownloadingInvoiceId] = useState(null);
+
+  const openCustomer = (order) =>
+    navigate(
+      `/customers/${encodeURIComponent(order.customerPhone)}?name=${encodeURIComponent(order.customerName || "")}`
+    );
+
+  const downloadInvoice = async (order) => {
+    // order.invoiceId is the backend's own single source of truth (see
+    // OrderDetailDrawer for why the old notes-tag fallback was removed).
+    const invoiceId = order.invoiceId;
+    if (!invoiceId) {
+      toast.error("No invoice found for this order yet");
+      return;
+    }
+    setDownloadingInvoiceId(order._id);
+    try {
+      const invoice =
+        invoiceById.get(invoiceId) || (await InvoiceService.getInvoiceById(invoiceId));
+      if (!invoice) {
+        toast.error("No invoice found for this order yet");
+        return;
+      }
+      await generateInvoicePdf(invoice, order.orderId);
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Could not download the invoice");
+    } finally {
+      setDownloadingInvoiceId(null);
+    }
+  };
+
+  const load = async (page = pagination.page) => {
+    setLoading(true);
+    try {
+      // Invoices too, so payments recorded on an order's invoice show here.
+      const [res, invoices] = await Promise.all([
+        ManualOrderService.getAll({ page, limit: pagination.limit }),
+        fetchAllInvoices(InvoiceService.getAllInvoices).catch(() => []),
+      ]);
+      const byId = new Map(invoices.map((invoice) => [invoice.invoiceId, invoice]));
+      setInvoiceById(byId);
+      setOrders(
+        (res?.data?.orders || []).map((order) =>
+          withInvoicePayment(order, byId.get(order.invoiceId))
+        )
+      );
+      setPagination((prevPagination) => ({
+        ...prevPagination,
+        ...(res?.data?.pagination || {}),
+        page,
+      }));
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Could not load orders");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Confirming needs courier details first (see CourierAssignModal), so that
+  // transition opens the modal instead of calling the status API directly.
+  const handleStatusChange = async (order, newStatus) => {
+    if (!newStatus || newStatus === order.orderStatus) return;
+    if (newStatus === "confirmed") {
+      setCourierModalOrder(order);
+      return;
+    }
+    setUpdatingOrderId(order._id);
+    try {
+      await ManualOrderService.updateStatus(order.orderId, newStatus);
+      toast.success(`Order marked as ${statusLabel(newStatus)}`);
+      await load(pagination.page);
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Could not update status");
+    } finally {
+      setUpdatingOrderId(null);
+    }
+  };
+
+  // "paid" needs a payment method (see MarkPaidModal), so only that
+  // direction opens a modal — "pending" just clears it, same as the backend.
+  const handlePaymentChange = async (order, newStatus) => {
+    if (newStatus === "paid") {
+      setPaidModalOrder(order);
+      return;
+    }
+    setUpdatingPaymentId(order._id);
+    try {
+      await ManualOrderService.updatePaymentStatus(order.orderId, { paymentStatus: newStatus });
+      toast.success(`Payment marked as ${statusLabel(newStatus)}`);
+      await load(pagination.page);
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Could not update payment status");
+    } finally {
+      setUpdatingPaymentId(null);
+    }
+  };
+
+  const filtered = useMemo(() => {
+    if (!query.trim()) return orders;
+    const searchText = query.trim().toLowerCase();
+    return orders.filter(
+      (order) =>
+        order.customerName?.toLowerCase().includes(searchText) ||
+        order.customerPhone?.includes(searchText) ||
+        order.orderId?.toLowerCase().includes(searchText) ||
+        order.organizationName?.toLowerCase().includes(searchText)
+    );
+  }, [orders, query]);
+
+  return (
+    <div>
+      <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="relative w-full sm:w-80">
+          <Search
+            size={16}
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-mist-400 dark:text-mist-500"
+          />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search client, phone, order ID…"
+            className="w-full rounded-lg border border-mist-200 bg-white py-2.5 pl-9 pr-3 text-sm text-ink-950 outline-none focus:border-orange-500 dark:border-ink-700 dark:bg-ink-900 dark:text-white dark:placeholder:text-mist-500"
+          />
+        </div>
+        <button
+          onClick={() => navigate("/orders/new")}
+          className="flex items-center justify-center gap-1.5 rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-orange-600"
+        >
+          <Plus size={16} /> New manual order
+        </button>
+      </div>
+
+      <div className="overflow-hidden rounded-xl2 border border-mist-200 bg-white shadow-panel dark:border-white/10 dark:bg-ink-900">
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-mist-500 dark:text-mist-300">
+            <Loader2 size={16} className="animate-spin" /> Loading orders…
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
+            <Inbox size={28} className="text-mist-300 dark:text-mist-500" />
+            <p className="text-sm font-medium text-ink-950 dark:text-white">
+              No orders match here yet
+            </p>
+            <p className="text-xs text-mist-500 dark:text-mist-300">
+              Try a different search, or create a new order.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Table — wide screens only (xl+), where every column fits without overlap */}
+            <div className="hidden overflow-x-auto xl:block">
+              <table className="w-full table-fixed text-left text-sm">
+                <colgroup>
+                  <col className="w-[21%]" />
+                  <col className="w-[16%]" />
+                  <col className="w-[9%]" />
+                  <col className="w-[10%]" />
+                  <col className="w-[17%]" />
+                  <col className="w-[17%]" />
+                  <col className="w-[10%]" />
+                </colgroup>
+                <thead>
+                  <tr className="border-b border-mist-100 text-xs uppercase tracking-wide text-mist-500 dark:border-white/10 dark:text-mist-300">
+                    <th className="px-4 py-3 font-semibold">Client</th>
+                    <th className="px-4 py-3 font-semibold">Created by</th>
+                    <th className="px-4 py-3 font-semibold">Items</th>
+                    <th className="px-4 py-3 font-semibold">Total</th>
+                    <th className="px-4 py-3 font-semibold">Payment</th>
+                    <th className="px-4 py-3 font-semibold">Status</th>
+                    <th className="px-4 py-3 font-semibold">Updated</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((order) => {
+                    const staffName = createdByName(order);
+                    return (
+                      <tr
+                        key={order._id}
+                        onClick={() => setActiveOrder(order)}
+                        className="cursor-pointer border-b border-mist-100 align-middle last:border-0 hover:bg-mist-50 dark:border-white/10 dark:hover:bg-white/5"
+                      >
+                        <td className="px-4 py-3">
+                          <div className="flex min-w-0 items-center gap-2.5">
+                            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-ink-950 text-xs font-bold text-white">
+                              {initials(order.customerName)}
+                            </span>
+                            <div className="min-w-0">
+                              <p
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openCustomer(order);
+                                }}
+                                className="truncate font-medium text-ink-950 hover:underline dark:text-white"
+                              >
+                                {order.customerName}
+                              </p>
+                              <p className="truncate text-xs text-mist-500 dark:text-mist-300">
+                                {order.customerPhone}
+                              </p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {staffName ? (
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-mist-200 text-[10px] font-bold text-mist-700 dark:bg-white/10 dark:text-mist-200">
+                                {initials(staffName)}
+                              </span>
+                              <span className="text-xs text-mist-700 dark:text-mist-300">
+                                {staffName}
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-mist-400 dark:text-mist-500">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-mist-700 dark:text-mist-300">
+                          {order.items?.length || 0} item{order.items?.length === 1 ? "" : "s"}
+                        </td>
+                        <td className="px-4 py-3 font-semibold text-ink-950 dark:text-white">
+                          <OrderTotal order={order} />
+                        </td>
+                        <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                          <div className="flex items-center gap-1.5">
+                            <PaymentStatusBadge status={order.paymentStatus} />
+                            {["refund_pending", "partial_refunded"].includes(
+                              order.paymentStatus
+                            ) ? (
+                              <button
+                                onClick={() => setSettleRefundOrder(order)}
+                                className="shrink-0 rounded-full border border-amber-400 px-2.5 py-1 text-[11px] font-semibold text-amber-500 hover:bg-amber-100 dark:text-amber-400 dark:hover:bg-amber-500/10"
+                              >
+                                Settle
+                              </button>
+                            ) : (
+                              <div className="grid h-8 w-8 shrink-0 place-items-center">
+                                {updatingPaymentId === order._id ? (
+                                  <Loader2
+                                    size={14}
+                                    className="animate-spin text-mist-400 dark:text-mist-500"
+                                  />
+                                ) : (
+                                  <PaymentActionMenu
+                                    currentStatus={order.paymentStatus}
+                                    onSelect={(paymentStatus) =>
+                                      handlePaymentChange(order, paymentStatus)
+                                    }
+                                  />
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                          <div className="flex items-center gap-1.5">
+                            <OrderStatusBadge status={order.orderStatus} />
+                            <div className="grid h-8 w-8 shrink-0 place-items-center">
+                              {updatingOrderId === order._id ? (
+                                <Loader2
+                                  size={14}
+                                  className="animate-spin text-mist-400 dark:text-mist-500"
+                                />
+                              ) : (
+                                <StatusActionMenu
+                                  nextStatuses={STATUS_FLOW[order.orderStatus] || []}
+                                  canCancel={!NON_CANCELLABLE.includes(order.orderStatus)}
+                                  onSelectStatus={(orderStatus) =>
+                                    handleStatusChange(order, orderStatus)
+                                  }
+                                  onCancel={() => setCancelModalOrder(order)}
+                                />
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-mist-500 dark:text-mist-300">
+                          {formatDateTime(order.statusUpdatedAt || order.createdAt)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Cards — phones/tablets, no horizontal scrolling at all */}
+            <div className="divide-y divide-mist-100 dark:divide-white/10 md:grid md:grid-cols-2 md:gap-px md:divide-y-0 md:bg-mist-100 md:dark:bg-white/10 xl:hidden">
+              {filtered.map((order) => {
+                const staffName = createdByName(order);
+                return (
+                  <div
+                    key={order._id}
+                    onClick={() => setActiveOrder(order)}
+                    className="cursor-pointer bg-white p-4 hover:bg-mist-50 dark:bg-ink-900 dark:hover:bg-ink-800"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-ink-950 text-xs font-bold text-white">
+                          {initials(order.customerName)}
+                        </span>
+                        <div className="min-w-0">
+                          <p
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openCustomer(order);
+                            }}
+                            className="truncate font-medium text-ink-950 dark:text-white"
+                          >
+                            {order.customerName}
+                          </p>
+                          <p className="text-xs text-mist-500 dark:text-mist-300">
+                            {order.customerPhone}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right font-semibold text-ink-950 dark:text-white">
+                        <OrderTotal order={order} />
+                      </div>
+                    </div>
+
+                    <p className="mt-2 truncate font-mono text-[11px] text-mist-500 dark:text-mist-300">
+                      {shortOrderId(order.orderId)}
+                    </p>
+                    <p className="text-xs text-mist-500 dark:text-mist-300">
+                      {order.items?.length || 0} item{order.items?.length === 1 ? "" : "s"} ·{" "}
+                      {formatDateTime(order.statusUpdatedAt || order.createdAt)}
+                      {staffName && <> · by {staffName}</>}
+                    </p>
+
+                    {/* Labelled dropdowns — tap the current value to change it */}
+                    <div
+                      className="mt-3 grid grid-cols-2 gap-2.5 border-t border-mist-100 pt-3 dark:border-white/10"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <div className="min-w-0">
+                        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-mist-500 dark:text-mist-300">
+                          Payment
+                        </p>
+                        {updatingPaymentId === order._id ? (
+                          <div className="flex min-h-[40px] items-center px-2.5">
+                            <Loader2
+                              size={16}
+                              className="animate-spin text-mist-400 dark:text-mist-500"
+                            />
+                          </div>
+                        ) : (
+                          <PaymentActionMenu
+                            variant="pill"
+                            currentStatus={order.paymentStatus}
+                            onSelect={(paymentStatus) => handlePaymentChange(order, paymentStatus)}
+                          />
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-mist-500 dark:text-mist-300">
+                          Order status
+                        </p>
+                        {updatingOrderId === order._id ? (
+                          <div className="flex min-h-[40px] items-center px-2.5">
+                            <Loader2
+                              size={16}
+                              className="animate-spin text-mist-400 dark:text-mist-500"
+                            />
+                          </div>
+                        ) : (
+                          <StatusActionMenu
+                            variant="pill"
+                            currentStatus={order.orderStatus}
+                            nextStatuses={STATUS_FLOW[order.orderStatus] || []}
+                            canCancel={!NON_CANCELLABLE.includes(order.orderStatus)}
+                            onSelectStatus={(orderStatus) => handleStatusChange(order, orderStatus)}
+                            onCancel={() => setCancelModalOrder(order)}
+                          />
+                        )}
+                      </div>
+                    </div>
+
+                    <div
+                      className="mt-2.5 flex items-center gap-2"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      {["refund_pending", "partial_refunded"].includes(order.paymentStatus) && (
+                        <button
+                          onClick={() => setSettleRefundOrder(order)}
+                          className="flex h-9 items-center rounded-lg border border-amber-400 px-3 text-xs font-semibold text-amber-500 hover:bg-amber-100 dark:text-amber-400 dark:hover:bg-amber-500/10"
+                        >
+                          Settle refund
+                        </button>
+                      )}
+                      <button
+                        onClick={() => downloadInvoice(order)}
+                        disabled={downloadingInvoiceId === order._id}
+                        className="ml-auto flex h-9 items-center gap-1.5 rounded-lg border border-mist-200 px-3 text-xs font-medium text-mist-700 hover:bg-mist-50 disabled:opacity-50 dark:border-white/10 dark:text-mist-300 dark:hover:bg-white/5"
+                      >
+                        {downloadingInvoiceId === order._id ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          <FileDown size={14} />
+                        )}
+                        Invoice
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {!loading && filtered.length > 0 && (
+          <div className="flex flex-col gap-2 border-t border-mist-100 px-5 py-3 dark:border-white/10 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-xs text-mist-500 dark:text-mist-300">
+              Page {pagination.page} of {pagination.totalPages} · {pagination.total} orders
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => load(pagination.page - 1)}
+                disabled={pagination.page <= 1}
+                className="grid h-8 w-8 place-items-center rounded-lg border border-mist-200 text-mist-500 hover:bg-mist-50 disabled:opacity-30 dark:border-white/10 dark:text-mist-300 dark:hover:bg-white/5"
+              >
+                <ChevronLeft size={15} />
+              </button>
+              <button
+                onClick={() => load(pagination.page + 1)}
+                disabled={pagination.page >= pagination.totalPages}
+                className="grid h-8 w-8 place-items-center rounded-lg border border-mist-200 text-mist-500 hover:bg-mist-50 disabled:opacity-30 dark:border-white/10 dark:text-mist-300 dark:hover:bg-white/5"
+              >
+                <ChevronRight size={15} />
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {activeOrder && (
+        <OrderDetailDrawer
+          orderSummary={activeOrder}
+          initialInvoice={invoiceById.get(activeOrder.invoiceId)}
+          allOrders={orders}
+          onClose={() => setActiveOrder(null)}
+          onChanged={() => {
+            // Refresh the background list only — the drawer stays open so
+            // staff can keep walking an order through its next steps
+            // (Placed → Packed → Confirmed → ...) without it closing on them
+            // after every single click.
+            load(pagination.page);
+          }}
+        />
+      )}
+
+      {courierModalOrder && (
+        <CourierAssignModal
+          order={courierModalOrder}
+          onClose={() => setCourierModalOrder(null)}
+          onDone={() => {
+            setCourierModalOrder(null);
+            load(pagination.page);
+          }}
+        />
+      )}
+
+      {cancelModalOrder && (
+        <CancelOrderModal
+          order={cancelModalOrder}
+          onClose={() => setCancelModalOrder(null)}
+          onDone={() => {
+            setCancelModalOrder(null);
+            load(pagination.page);
+          }}
+        />
+      )}
+
+      {paidModalOrder && (
+        <MarkPaidModal
+          order={paidModalOrder}
+          onClose={() => setPaidModalOrder(null)}
+          onDone={() => {
+            setPaidModalOrder(null);
+            load(pagination.page);
+          }}
+        />
+      )}
+
+      {settleRefundOrder && (
+        <SettleRefundModal
+          order={settleRefundOrder}
+          onClose={() => setSettleRefundOrder(null)}
+          onDone={() => {
+            setSettleRefundOrder(null);
+            load(pagination.page);
+          }}
+        />
+      )}
+    </div>
+  );
+}

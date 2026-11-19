@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: "Inter", sans-serif;
+  }
+  body {
+    @apply bg-mist-50 text-mist-700 antialiased dark:bg-ink-950 dark:text-mist-300;
+  }
+  ::selection {
+    @apply bg-orange-100 text-orange-700;
+  }
+  *:focus-visible {
+    outline: 2px solid #f2701c;
+    outline-offset: 2px;
+  }
+  /* Phones: 16px form text stops iOS Safari from zooming in on every tap. */
+  @media (max-width: 639px) {
+    input:not([type="checkbox"]):not([type="radio"]),
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
+  }
+  /* Number inputs: no spinner arrows (tiny on touch and easy to bump). */
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] {
+    -moz-appearance: textfield;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #c7c7c7;
+    border-radius: 999px;
+  }
+  .dark .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #3d3d3d;
+  }
+}
